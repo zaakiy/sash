@@ -2,7 +2,10 @@
 
 `sash` stands for **S**uper **A**wesome **SH**ell commands.
 
-It does what it says on the tin
+It does what it says on the tin.
+
+‼️ Bit of a warning, I use zsh, so these functions may not have been tested in other shells.
+
 
 
 ## ⏳ Countdown Timer
