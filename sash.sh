@@ -15,6 +15,7 @@ countdown() {
     echo "Examples: countdown 90         # 90 seconds"
     echo "          countdown 1h30m      # 1 hour 30 minutes"
     echo "          countdown 1h30m19s   # 1 hour 30 minutes 19 seconds"
+    echo "          countdown 5m45s      # 5 minutes 45 seconds"
     echo "          countdown 45s        # 45 seconds"
     return 1
   fi
