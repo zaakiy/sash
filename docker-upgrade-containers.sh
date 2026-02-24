@@ -5,7 +5,7 @@
 # Interactive Docker container upgrade tool
 # Handles both standalone containers and docker-compose managed containers
 
-docker-upgrade-containers() {
+docker_upgrade_containers() {
   set -e  # Exit on error
 
   # Colors for output
