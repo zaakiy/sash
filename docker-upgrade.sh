@@ -1,8 +1,133 @@
-#!/bin/sh
-# docker-upgrade.sh - Interactive Docker container upgrade tool (POSIX-compliant)
+#!/usr/bin/env bash
+# docker-upgrade.sh - Interactive Docker container upgrade tool
 # Handles both standalone containers and docker-compose managed containers
+# Cross-platform: Linux (bash) and macOS (bash 4+ or zsh)
+
+# ============================================================
+# SHELL DETECTION & RE-EXEC LAYER
+# ============================================================
+
+if [ -n "$BASH_VERSION" ]; then
+    CURRENT_SHELL="bash"
+    BASH_MAJOR="${BASH_VERSINFO[0]}"
+elif [ -n "$ZSH_VERSION" ]; then
+    CURRENT_SHELL="zsh"
+    BASH_MAJOR=0
+else
+    CURRENT_SHELL="unknown"
+    BASH_MAJOR=0
+fi
+
+# If we're in bash < 4 (stock macOS bash), re-exec under zsh
+if [ "$CURRENT_SHELL" = "bash" ] && [ "$BASH_MAJOR" -lt 4 ]; then
+    if command -v zsh >/dev/null 2>&1; then
+        echo "Bash $BASH_VERSION detected (no associative array support)."
+        echo "Re-launching under zsh..."
+        exec zsh "$0" "$@"
+    else
+        echo "ERROR: Bash $BASH_VERSION is too old and zsh is not available."
+        echo "Please install bash 4+ or zsh."
+        exit 1
+    fi
+fi
+
+# ============================================================
+# ZSH COMPATIBILITY LAYER
+# ============================================================
+# When running under zsh, we need different syntax for:
+#   1. Array index iteration  (bash: ${!arr[@]}  vs  zsh: ${(k)arr} )
+#   2. Associative array declaration scope
+#   3. Regex match captures   (bash: BASH_REMATCH  vs  zsh: match)
+#   4. Redirect shorthand     (bash: &>/dev/null   vs  zsh: varies)
+#
+# Strategy: define helper functions that abstract the differences.
+# ============================================================
+
+if [ "$CURRENT_SHELL" = "zsh" ]; then
+    emulate -L zsh
+    setopt KSH_ARRAYS       # 0-indexed arrays
+    setopt NO_NOMATCH       # Don't error on failed globs
+    setopt PIPE_FAIL        # Catch pipe failures
+    setopt REMATCH_PCRE     # Use PCRE for =~ matching
+
+    # --- Get indices of an indexed array ---
+    # bash:  ${!arr[@]}   →   0 1 2 3 ...
+    # zsh:   ${(k)arr[@]} doesn't work with KSH_ARRAYS for indexed arrays
+    # Solution: generate index sequence from length
+    array_indices() {
+        local arr_name=$1
+        local len
+        eval "len=\${#${arr_name}[@]}"
+        local i=0
+        while [ $i -lt $len ]; do
+            echo $i
+            i=$((i + 1))
+        done
+    }
+
+    # --- Get length of an indexed array ---
+    array_length() {
+        local arr_name=$1
+        eval "echo \${#${arr_name}[@]}"
+    }
+
+    # --- Regex match with capture groups ---
+    # zsh with REMATCH_PCRE populates $MATCH and $match (array)
+    # We normalize to BASH_REMATCH-style access
+    regex_match() {
+        local string="$1"
+        local pattern="$2"
+        if [[ "$string" =~ $pattern ]]; then
+            # zsh puts captures in $match array (1-indexed natively,
+            # but KSH_ARRAYS makes it 0-indexed)
+            BASH_REMATCH=("$MATCH" "${match[@]}")
+            return 0
+        fi
+        return 1
+    }
+
+else
+    # --- Bash versions of the same helpers ---
+    array_indices() {
+        local arr_name=$1
+        eval "echo \${!${arr_name}[@]}"
+    }
+
+    array_length() {
+        local arr_name=$1
+        eval "echo \${#${arr_name}[@]}"
+    }
+
+    regex_match() {
+        local string="$1"
+        local pattern="$2"
+        if [[ "$string" =~ $pattern ]]; then
+            return 0
+        fi
+        return 1
+    }
+fi
 
 set -e  # Exit on error
+
+# ============================================================
+# PLATFORM DETECTION
+# ============================================================
+detect_platform() {
+    PLATFORM_OS="$(uname -s)"
+    PLATFORM_ARCH="$(uname -m)"
+
+    case "$PLATFORM_OS" in
+        Darwin*)  PLATFORM="macos"   ;;
+        Linux*)   PLATFORM="linux"   ;;
+        FreeBSD*) PLATFORM="freebsd" ;;
+        *)        PLATFORM="unknown" ;;
+    esac
+
+    export PLATFORM PLATFORM_OS PLATFORM_ARCH
+}
+
+detect_platform
 
 # Colors for output
 RED='\033[0;31m'
@@ -13,83 +138,204 @@ PURPLE='\033[0;35m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Cache configuration
+# ============================================================
+# CROSS-PLATFORM WRAPPER FUNCTIONS
+# ============================================================
+
+portable_stat_mtime() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        echo "0"
+        return 1
+    fi
+    case "$PLATFORM" in
+        macos|freebsd) stat -f %m "$file" 2>/dev/null ;;
+        linux)         stat -c %Y "$file" 2>/dev/null ;;
+        *)             stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || { echo "0"; return 1; } ;;
+    esac
+}
+
+portable_timeout() {
+    local duration="$1"
+    shift
+
+    case "$PLATFORM" in
+        linux)
+            timeout "$duration" "$@"
+            ;;
+        macos|freebsd)
+            if command -v gtimeout >/dev/null 2>&1; then
+                gtimeout "$duration" "$@"
+            elif command -v timeout >/dev/null 2>&1; then
+                timeout "$duration" "$@"
+            elif command -v perl >/dev/null 2>&1; then
+                perl -e '
+                    use POSIX ":sys_wait_h";
+                    my $timeout = shift @ARGV;
+                    my $pid = fork();
+                    if ($pid == 0) { exec @ARGV or die "exec: $!"; }
+                    eval {
+                        local $SIG{ALRM} = sub { kill("TERM", $pid); die "alarm\n"; };
+                        alarm $timeout;
+                        waitpid($pid, 0);
+                        alarm 0;
+                    };
+                    if ($@ && $@ eq "alarm\n") {
+                        sleep 1;
+                        kill("KILL", $pid) if kill(0, $pid);
+                        exit 124;
+                    }
+                    exit ($? >> 8);
+                ' "$duration" "$@"
+            else
+                echo -e "${YELLOW}⚠️  No timeout available — running without${NC}" >&2
+                "$@"
+            fi
+            ;;
+        *)
+            if command -v timeout >/dev/null 2>&1; then
+                timeout "$duration" "$@"
+            else
+                "$@"
+            fi
+            ;;
+    esac
+}
+
+portable_wc_l() {
+    wc -l | tr -d '[:space:]'
+}
+
+portable_epoch() {
+    date +%s 2>/dev/null \
+        || python3 -c 'import time; print(int(time.time()))' 2>/dev/null \
+        || perl -e 'print time' 2>/dev/null \
+        || { echo "0"; return 1; }
+}
+
+portable_sed_inplace() {
+    local expression="$1"
+    local file="$2"
+    case "$PLATFORM" in
+        macos|freebsd) sed -i '' "$expression" "$file" ;;
+        linux)         sed -i "$expression" "$file" ;;
+        *)             sed -i "$expression" "$file" 2>/dev/null || sed -i '' "$expression" "$file" ;;
+    esac
+}
+
+portable_tput_clear_lines() {
+    local count="$1"
+    local i
+    for ((i = 0; i < count; i++)); do
+        tput cuu1 2>/dev/null && tput el 2>/dev/null || true
+    done
+}
+
+# ============================================================
+# DEPENDENCY CHECK
+# ============================================================
+check_platform_dependencies() {
+    echo -e "${BLUE}=== Platform & Dependency Check ===${NC}"
+    echo "  OS:    $PLATFORM ($PLATFORM_OS $PLATFORM_ARCH)"
+    echo "  Shell: $CURRENT_SHELL ${ZSH_VERSION}${BASH_VERSION}"
+
+    if [ "$PLATFORM" = "macos" ]; then
+        local macos_ver
+        macos_ver=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
+        echo "  macOS: $macos_ver"
+    fi
+    echo ""
+
+    local has_missing=false
+
+    if ! command -v docker >/dev/null 2>&1; then
+        echo -e "  ${RED}✗${NC} docker (REQUIRED)"
+        has_missing=true
+    else
+        echo -e "  ${GREEN}✓${NC} docker"
+    fi
+
+    if ! command -v skopeo >/dev/null 2>&1; then
+        echo -ne "  ${YELLOW}○${NC} skopeo (optional — needed for update checks)"
+        case "$PLATFORM" in
+            macos) echo "  →  brew install skopeo" ;;
+            linux) echo "  →  sudo apt-get install skopeo" ;;
+            *)     echo "" ;;
+        esac
+    else
+        echo -e "  ${GREEN}✓${NC} skopeo"
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -ne "  ${YELLOW}○${NC} jq (optional — needed for update checks)"
+        case "$PLATFORM" in
+            macos) echo "  →  brew install jq" ;;
+            linux) echo "  →  sudo apt-get install jq" ;;
+            *)     echo "" ;;
+        esac
+    else
+        echo -e "  ${GREEN}✓${NC} jq"
+    fi
+
+    if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+        echo -ne "  ${YELLOW}○${NC} timeout (optional — perl fallback available)"
+        if [ "$PLATFORM" = "macos" ]; then
+            echo "  →  brew install coreutils"
+        else
+            echo ""
+        fi
+    else
+        echo -e "  ${GREEN}✓${NC} timeout"
+    fi
+
+    if command -v docker-compose >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} docker-compose"
+    elif docker compose version >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} docker compose (plugin)"
+    else
+        echo -e "  ${YELLOW}○${NC} docker-compose (needed for compose projects)"
+    fi
+
+    echo ""
+
+    if [ "$has_missing" = true ]; then
+        echo -e "${RED}❌ Missing required dependencies. Exiting.${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✓ All required dependencies satisfied${NC}"
+    echo ""
+}
+
+check_platform_dependencies
+
+# ============================================================
+# CACHE CONFIGURATION
+# ============================================================
 CACHE_DIR="/tmp/docker-upgrade-cache-$$"
-CACHE_VALIDITY_SECONDS=300  # 5 minutes
+CACHE_VALIDITY_SECONDS=300
 mkdir -p "$CACHE_DIR"
 
-# Data directory for our "arrays" (files-based approach)
-DATA_DIR="/tmp/docker-upgrade-data-$$"
-mkdir -p "$DATA_DIR"
-
-# Cleanup on exit
-cleanup() {
-    rm -rf "$DATA_DIR"
-    rm -rf "$CACHE_DIR"
-}
-trap cleanup EXIT INT TERM
-
-# --- Utility: file-based list helpers ---
-# Since POSIX sh has no arrays, we store items in numbered files.
-# E.g., DATA_DIR/item.0, DATA_DIR/item.1, ...
-# item_count is tracked in DATA_DIR/count
-
-get_item_count() {
-    if [ -f "$DATA_DIR/count" ]; then
-        cat "$DATA_DIR/count"
-    else
-        echo 0
-    fi
-}
-
-set_item_count() {
-    echo "$1" > "$DATA_DIR/count"
-}
-
-set_field() {
-    # set_field <index> <field> <value>
-    echo "$3" > "$DATA_DIR/${2}.${1}"
-}
-
-get_field() {
-    # get_field <index> <field>
-    if [ -f "$DATA_DIR/${2}.${1}" ]; then
-        cat "$DATA_DIR/${2}.${1}"
-    else
-        echo ""
-    fi
-}
-
-# Compose project tracking (simple file-based set)
-has_compose_project() {
-    [ -f "$DATA_DIR/compose_project_seen.$1" ]
-}
-
-mark_compose_project() {
-    echo "1" > "$DATA_DIR/compose_project_seen.$1"
-}
-
-clear_compose_projects() {
-    rm -f "$DATA_DIR"/compose_project_seen.* 2>/dev/null || true
-}
-
-# --- Cache functions ---
 get_cache_file() {
-    _image="$1"
-    _safe_name=$(printf '%s' "$_image" | sed 's/[^a-zA-Z0-9._-]/_/g')
-    echo "$CACHE_DIR/$_safe_name.cache"
+    local image=$1
+    local safe_name=$(echo "$image" | sed 's/[^a-zA-Z0-9._-]/_/g')
+    echo "$CACHE_DIR/$safe_name.cache"
 }
 
 is_cache_valid() {
-    _cache_file="$1"
-    if [ ! -f "$_cache_file" ]; then
+    local cache_file=$1
+
+    if [ ! -f "$cache_file" ]; then
         return 1
     fi
-    # Try GNU stat first, then BSD stat
-    _cache_time=$(stat -c %Y "$_cache_file" 2>/dev/null || stat -f %m "$_cache_file" 2>/dev/null) || return 1
-    _current_time=$(date +%s)
-    _age=$((_current_time - _cache_time))
-    if [ "$_age" -lt "$CACHE_VALIDITY_SECONDS" ]; then
+
+    local cache_time
+    cache_time=$(portable_stat_mtime "$cache_file")
+    local current_time
+    current_time=$(portable_epoch)
+    local age=$((current_time - cache_time))
+
+    if [ $age -lt $CACHE_VALIDITY_SECONDS ]; then
         return 0
     else
         return 1
@@ -97,950 +343,901 @@ is_cache_valid() {
 }
 
 read_cache() {
-    _cache_file="$1"
-    if [ -f "$_cache_file" ]; then
-        cat "$_cache_file"
+    local cache_file=$1
+    if [ -f "$cache_file" ]; then
+        cat "$cache_file"
     fi
 }
 
 write_cache() {
-    _cache_file="$1"
-    _result="$2"
-    echo "$_result" > "$_cache_file"
+    local cache_file=$1
+    local result=$2
+    echo "$result" > "$cache_file"
 }
 
-# --- Docker auth check ---
+# ============================================================
+# MAIN SCRIPT START
+# ============================================================
+echo -e "${BLUE}=== Docker Container Upgrade Tool ===${NC}"
+echo ""
+
+ALL_CONTAINERS=$(docker ps -a --format "{{.Names}}")
+
+if [ -z "$ALL_CONTAINERS" ]; then
+    echo "No Docker containers found"
+    exit 0
+fi
+
+declare -a ITEM_ARRAY
+declare -a ITEM_TYPE_ARRAY
+declare -a UPDATE_AVAILABLE_ARRAY
+declare -a UPDATE_COUNT_ARRAY
+declare -a RECENTLY_UPGRADED_ARRAY
+declare -A COMPOSE_PROJECTS
+declare -A COMPOSE_DIRS
+declare -A COMPOSE_FILES
+
 check_docker_auth() {
-    _registry="${1:-docker.io}"
+    local registry=${1:-"docker.io"}
+
     if docker system info 2>/dev/null | grep -q "Username:"; then
         return 0
     fi
-    if timeout 10 skopeo inspect --command-timeout 10s "docker://${_registry}/library/alpine:latest" >/dev/null 2>&1; then
+
+    if portable_timeout 10 skopeo inspect --command-timeout 10s "docker://${registry}/library/alpine:latest" >/dev/null 2>&1; then
         return 0
     fi
+
     return 1
 }
 
 prompt_docker_login() {
     echo ""
-    printf "${YELLOW}⚠️  Docker Registry Authentication${NC}\n"
+    echo -e "${YELLOW}⚠️  Docker Registry Authentication${NC}"
     echo ""
     echo "To avoid rate limiting and timeouts, it's recommended to authenticate with Docker registries."
     echo ""
     echo "Docker Hub (docker.io) limits anonymous requests to 100 pulls per 6 hours."
     echo "Authenticated users get 200 pulls per 6 hours (free tier) or unlimited (paid)."
     echo ""
-    printf "Would you like to log in to Docker Hub now? (y/n) "
-    read -r REPLY
-    case "$REPLY" in
-        [Yy]|[Yy][Ee][Ss])
+    read "REPLY?Would you like to log in to Docker Hub now? (y/n) "
+
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo ""
+        echo -e "${BLUE}=== Logging in to Docker Hub ===${NC}"
+        echo ""
+
+        if docker login; then
             echo ""
-            printf "${BLUE}=== Logging in to Docker Hub ===${NC}\n"
+            echo -e "${GREEN}✓ Successfully logged in to Docker Hub${NC}"
+            return 0
+        else
             echo ""
-            if docker login; then
-                echo ""
-                printf "${GREEN}✓ Successfully logged in to Docker Hub${NC}\n"
-                return 0
-            else
-                echo ""
-                printf "${RED}❌ Login failed${NC}\n"
-                return 1
-            fi
-            ;;
-        *)
-            echo ""
-            printf "${YELLOW}Continuing without authentication (may experience rate limiting)${NC}\n"
+            echo -e "${RED}❌ Login failed${NC}"
             return 1
-            ;;
-    esac
+        fi
+    else
+        echo ""
+        echo -e "${YELLOW}Continuing without authentication (may experience rate limiting)${NC}"
+        return 1
+    fi
 }
 
-# --- Update check ---
 check_update_available() {
-    _image="$1"
-    _timeout="${SKOPEO_TIMEOUT:-30}"
-    _max_retries="${SKOPEO_RETRIES:-3}"
+    local image=$1
+    local tmout=${SKOPEO_TIMEOUT:-30}
+    local max_retries=${SKOPEO_RETRIES:-3}
 
-    _cache_file=$(get_cache_file "$_image")
-    if is_cache_valid "$_cache_file"; then
-        _cached_result=$(read_cache "$_cache_file")
-        return "$_cached_result"
+    local cache_file=$(get_cache_file "$image")
+    if is_cache_valid "$cache_file"; then
+        local cached_result=$(read_cache "$cache_file")
+        return $cached_result
     fi
 
-    _local_digest=$(docker inspect --type=image --format='{{index .RepoDigests 0}}' "$_image" 2>/dev/null | cut -d'@' -f2)
-    if [ -z "$_local_digest" ]; then
-        write_cache "$_cache_file" 2
+    local local_digest=$(docker inspect --type=image --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null | cut -d'@' -f2)
+
+    if [ -z "$local_digest" ]; then
+        write_cache "$cache_file" 2
         return 2
     fi
 
-    _remote_digest=""
-    _retry=0
-    while [ "$_retry" -le "$_max_retries" ]; do
-        if [ "$_retry" -gt 0 ]; then
-            printf "(retry %s/%s) " "$_retry" "$_max_retries"
-        fi
-        _remote_digest=$(timeout "$_timeout" skopeo inspect --command-timeout "${_timeout}s" "docker://$_image" 2>/dev/null | jq -r '.Digest' 2>/dev/null) || true
+    local remote_digest=""
+    local retry=0
 
-        if [ -n "$_remote_digest" ] && [ "$_remote_digest" != "null" ]; then
+    while [ $retry -le $max_retries ]; do
+        if [ $retry -gt 0 ]; then
+            echo -n "(retry $retry/$max_retries) "
+        fi
+
+        remote_digest=$(portable_timeout $((tmout)) skopeo inspect --command-timeout ${tmout}s docker://"$image" 2>/dev/null | jq -r '.Digest' 2>/dev/null)
+
+        if [ -n "$remote_digest" ] && [ "$remote_digest" != "null" ]; then
             break
         fi
-        _retry=$((_retry + 1))
+
+        retry=$((retry + 1))
     done
 
-    if [ -z "$_remote_digest" ] || [ "$_remote_digest" = "null" ]; then
-        write_cache "$_cache_file" 2
+    if [ -z "$remote_digest" ] || [ "$remote_digest" = "null" ]; then
+        write_cache "$cache_file" 2
         return 2
     fi
 
-    if [ "$_local_digest" != "$_remote_digest" ]; then
-        write_cache "$_cache_file" 0
+    if [ "$local_digest" != "$remote_digest" ]; then
+        write_cache "$cache_file" 0
         return 0
     else
-        write_cache "$_cache_file" 1
+        write_cache "$cache_file" 1
         return 1
     fi
 }
 
 check_update_async() {
-    _image="$1"
-    _cache_file=$(get_cache_file "$_image")
-    if is_cache_valid "$_cache_file"; then
+    local image=$1
+
+    local cache_file=$(get_cache_file "$image")
+    if is_cache_valid "$cache_file"; then
         return
     fi
-    (SKOPEO_TIMEOUT=5 SKOPEO_RETRIES=1; export SKOPEO_TIMEOUT SKOPEO_RETRIES; check_update_available "$_image" >/dev/null 2>&1) &
+
+    (SKOPEO_TIMEOUT=5 SKOPEO_RETRIES=1 check_update_available "$image" >/dev/null 2>&1) &
 }
 
-# --- Container scanning ---
+# ============================================================
+# scan_containers — uses array_indices() helper
+# ============================================================
 scan_containers() {
-    # Save previous state into temp files
-    _old_count=$(get_item_count)
-    mkdir -p "$DATA_DIR/old"
-    _oi=0
-    while [ "$_oi" -lt "$_old_count" ]; do
-        _oname=$(get_field "$_oi" "item")
-        _oupdate=$(get_field "$_oi" "update")
-        _oupgraded=$(get_field "$_oi" "upgraded")
-        if [ -n "$_oname" ]; then
-            echo "$_oupdate" > "$DATA_DIR/old/update.$_oname"
-            echo "$_oupgraded" > "$DATA_DIR/old/upgraded.$_oname"
-        fi
-        _oi=$((_oi + 1))
+    declare -A OLD_UPDATE_STATUS
+    declare -A OLD_UPGRADED_STATUS
+
+    local i
+    for i in $(array_indices ITEM_ARRAY); do
+        OLD_UPDATE_STATUS["${ITEM_ARRAY[$i]}"]="${UPDATE_AVAILABLE_ARRAY[$i]}"
+        OLD_UPGRADED_STATUS["${ITEM_ARRAY[$i]}"]="${RECENTLY_UPGRADED_ARRAY[$i]}"
     done
 
-    # Clear data
-    rm -f "$DATA_DIR"/item.* "$DATA_DIR"/type.* "$DATA_DIR"/update.* "$DATA_DIR"/upgraded.* "$DATA_DIR"/ucount.* 2>/dev/null || true
-    clear_compose_projects
-    set_item_count 0
+    ITEM_ARRAY=()
+    ITEM_TYPE_ARRAY=()
+    UPDATE_AVAILABLE_ARRAY=()
+    UPDATE_COUNT_ARRAY=()
+    RECENTLY_UPGRADED_ARRAY=()
+    COMPOSE_PROJECTS=()
 
     echo "Scanning containers..."
 
     ALL_CONTAINERS=$(docker ps -a --format "{{.Names}}")
-    if [ -z "$ALL_CONTAINERS" ]; then
-        return
-    fi
-
-    _idx=0
-    echo "$ALL_CONTAINERS" | while IFS= read -r container; do
-        # Re-read idx from file since we're in a subshell-safe pattern
-        true
-    done
-
-    # Because piping into while creates a subshell in POSIX sh,
-    # we use a temp file approach
-    _idx=0
-    _tmpcontainers="$DATA_DIR/tmpcontainers"
-    echo "$ALL_CONTAINERS" > "$_tmpcontainers"
 
     while IFS= read -r container; do
-        COMPOSE_PROJECT=$(docker inspect --format='{{index .Config.Labels "com.docker.compose.project"}}' "$container" 2>/dev/null) || COMPOSE_PROJECT=""
+        COMPOSE_PROJECT=$(docker inspect --format='{{index .Config.Labels "com.docker.compose.project"}}' "$container" 2>/dev/null || echo "")
 
         if [ -n "$COMPOSE_PROJECT" ]; then
-            if ! has_compose_project "$COMPOSE_PROJECT"; then
-                mark_compose_project "$COMPOSE_PROJECT"
+            if [ -z "${COMPOSE_PROJECTS[$COMPOSE_PROJECT]}" ]; then
+                COMPOSE_PROJECTS[$COMPOSE_PROJECT]=1
+                ITEM_ARRAY+=("$COMPOSE_PROJECT")
+                ITEM_TYPE_ARRAY+=("compose:$COMPOSE_PROJECT")
 
-                set_field "$_idx" "item" "$COMPOSE_PROJECT"
-                set_field "$_idx" "type" "compose:$COMPOSE_PROJECT"
-
-                # Restore previous status
-                if [ -f "$DATA_DIR/old/update.$COMPOSE_PROJECT" ]; then
-                    set_field "$_idx" "update" "$(cat "$DATA_DIR/old/update.$COMPOSE_PROJECT")"
+                if [ -n "${OLD_UPDATE_STATUS[$COMPOSE_PROJECT]}" ]; then
+                    UPDATE_AVAILABLE_ARRAY+=("${OLD_UPDATE_STATUS[$COMPOSE_PROJECT]}")
                 else
-                    set_field "$_idx" "update" "unknown"
-                fi
-                if [ -f "$DATA_DIR/old/upgraded.$COMPOSE_PROJECT" ]; then
-                    set_field "$_idx" "upgraded" "$(cat "$DATA_DIR/old/upgraded.$COMPOSE_PROJECT")"
-                else
-                    set_field "$_idx" "upgraded" "no"
+                    UPDATE_AVAILABLE_ARRAY+=("unknown")
                 fi
 
-                # Store compose directory and file
-                _cdir=$(docker inspect --format='{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$container" 2>/dev/null) || _cdir=""
-                _cfile=$(docker inspect --format='{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$container" 2>/dev/null) || _cfile=""
-                set_field "$COMPOSE_PROJECT" "composedir" "$_cdir"
-                set_field "$COMPOSE_PROJECT" "composefile" "$_cfile"
+                if [ -n "${OLD_UPGRADED_STATUS[$COMPOSE_PROJECT]}" ]; then
+                    RECENTLY_UPGRADED_ARRAY+=("${OLD_UPGRADED_STATUS[$COMPOSE_PROJECT]}")
+                else
+                    RECENTLY_UPGRADED_ARRAY+=("no")
+                fi
 
-                _idx=$((_idx + 1))
-                set_item_count "$_idx"
+                COMPOSE_DIRS[$COMPOSE_PROJECT]=$(docker inspect --format='{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$container")
+                COMPOSE_FILES[$COMPOSE_PROJECT]=$(docker inspect --format='{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$container")
             fi
         else
-            set_field "$_idx" "item" "$container"
-            set_field "$_idx" "type" "standalone"
+            ITEM_ARRAY+=("$container")
+            ITEM_TYPE_ARRAY+=("standalone")
 
-            if [ -f "$DATA_DIR/old/update.$container" ]; then
-                set_field "$_idx" "update" "$(cat "$DATA_DIR/old/update.$container")"
+            if [ -n "${OLD_UPDATE_STATUS[$container]}" ]; then
+                UPDATE_AVAILABLE_ARRAY+=("${OLD_UPDATE_STATUS[$container]}")
             else
-                set_field "$_idx" "update" "unknown"
-            fi
-            if [ -f "$DATA_DIR/old/upgraded.$container" ]; then
-                set_field "$_idx" "upgraded" "$(cat "$DATA_DIR/old/upgraded.$container")"
-            else
-                set_field "$_idx" "upgraded" "no"
+                UPDATE_AVAILABLE_ARRAY+=("unknown")
             fi
 
-            _idx=$((_idx + 1))
-            set_item_count "$_idx"
+            if [ -n "${OLD_UPGRADED_STATUS[$container]}" ]; then
+                RECENTLY_UPGRADED_ARRAY+=("${OLD_UPGRADED_STATUS[$container]}")
+            else
+                RECENTLY_UPGRADED_ARRAY+=("no")
+            fi
         fi
-    done < "$_tmpcontainers"
-
-    rm -rf "$DATA_DIR/old"
+    done <<< "$ALL_CONTAINERS"
 }
 
-# --- Async checks ---
+scan_containers
+
+# ============================================================
+# start_async_checks — uses array_indices()
+# ============================================================
 start_async_checks() {
     if ! command -v skopeo >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
         return
     fi
-    _count=$(get_item_count)
-    _i=0
-    while [ "$_i" -lt "$_count" ]; do
-        _item=$(get_field "$_i" "item")
-        _itype=$(get_field "$_i" "type")
 
-        case "$_itype" in
-            compose:*)
-                _project="${_itype#compose:}"
-                _images=$(docker ps -a --filter "label=com.docker.compose.project=$_project" --format "{{.Image}}" | sort -u)
-                echo "$_images" | while IFS= read -r _img; do
-                    if [ -n "$_img" ]; then
-                        check_update_async "$_img"
-                    fi
-                done
-                ;;
-            *)
-                _img=$(docker inspect --format='{{.Config.Image}}' "$_item" 2>/dev/null) || _img=""
-                if [ -n "$_img" ]; then
-                    check_update_async "$_img"
+    local i
+    for i in $(array_indices ITEM_ARRAY); do
+        ITEM="${ITEM_ARRAY[$i]}"
+        ITEM_TYPE="${ITEM_TYPE_ARRAY[$i]}"
+
+        if [[ "$ITEM_TYPE" == "compose:"* ]]; then
+            PROJECT_NAME="${ITEM_TYPE#compose:}"
+            IMAGES=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format "{{.Image}}" | sort -u)
+
+            while IFS= read -r image; do
+                if [ -n "$image" ]; then
+                    check_update_async "$image"
                 fi
-                ;;
-        esac
-        _i=$((_i + 1))
-    done
-}
-
-# --- Reload cache status ---
-reload_cache_status() {
-    _count=$(get_item_count)
-    _i=0
-    while [ "$_i" -lt "$_count" ]; do
-        _item=$(get_field "$_i" "item")
-        _itype=$(get_field "$_i" "type")
-
-        case "$_itype" in
-            compose:*)
-                _project="${_itype#compose:}"
-                _images=$(docker ps -a --filter "label=com.docker.compose.project=$_project" --format "{{.Image}}" | sort -u)
-
-                _has_update=false
-                _has_cached=false
-                _up_count=0
-                _total_count=0
-
-                echo "$_images" | while IFS= read -r _img; do
-                    if [ -n "$_img" ]; then
-                        _cf=$(get_cache_file "$_img")
-                        _total_count=$((_total_count + 1))
-                        if is_cache_valid "$_cf"; then
-                            _has_cached=true
-                            _cr=$(read_cache "$_cf")
-                            if [ "$_cr" = "0" ]; then
-                                _has_update=true
-                                _up_count=$((_up_count + 1))
-                            fi
-                        fi
-                        # Write intermediate results to file
-                        echo "$_has_update" > "$DATA_DIR/tmp_has_update"
-                        echo "$_has_cached" > "$DATA_DIR/tmp_has_cached"
-                        echo "$_up_count" > "$DATA_DIR/tmp_up_count"
-                        echo "$_total_count" > "$DATA_DIR/tmp_total_count"
-                    fi
-                done
-
-                # Read results from temp files (handles subshell issue)
-                if [ -f "$DATA_DIR/tmp_has_update" ]; then
-                    _has_update=$(cat "$DATA_DIR/tmp_has_update")
-                    _has_cached=$(cat "$DATA_DIR/tmp_has_cached")
-                    _up_count=$(cat "$DATA_DIR/tmp_up_count")
-                    _total_count=$(cat "$DATA_DIR/tmp_total_count")
-                    rm -f "$DATA_DIR"/tmp_has_update "$DATA_DIR"/tmp_has_cached "$DATA_DIR"/tmp_up_count "$DATA_DIR"/tmp_total_count
-                fi
-
-                set_field "$_i" "ucount" "${_up_count}/${_total_count}"
-
-                if [ "$_has_cached" = "true" ]; then
-                    if [ "$_has_update" = "true" ]; then
-                        set_field "$_i" "update" "yes"
-                    else
-                        set_field "$_i" "update" "no"
-                    fi
-                fi
-                ;;
-            *)
-                _container="$_item"
-                _img=$(docker inspect --format='{{.Config.Image}}' "$_container" 2>/dev/null) || _img=""
-                if [ -n "$_img" ]; then
-                    _cf=$(get_cache_file "$_img")
-                    if is_cache_valid "$_cf"; then
-                        _cr=$(read_cache "$_cf")
-                        if [ "$_cr" = "0" ]; then
-                            set_field "$_i" "update" "yes"
-                            set_field "$_i" "ucount" "1/1"
-                        elif [ "$_cr" = "1" ]; then
-                            set_field "$_i" "update" "no"
-                            set_field "$_i" "ucount" "0/1"
-                        elif [ "$_cr" = "2" ]; then
-                            set_field "$_i" "update" "unknown"
-                            set_field "$_i" "ucount" "?/1"
-                        fi
-                    else
-                        set_field "$_i" "ucount" "?/1"
-                    fi
-                else
-                    set_field "$_i" "ucount" "?/1"
-                fi
-                ;;
-        esac
-        _i=$((_i + 1))
-    done
-}
-
-# --- Display table ---
-display_table() {
-    echo "Available containers to upgrade:"
-    echo ""
-
-    printf "%-4s  %-35s  %-50s  %-12s  %-35s  %-20s\n" \
-        "No." "Name" "Image" "Status" "Type" "Update"
-    printf "%-4s  %-35s  %-50s  %-12s  %-35s  %-20s\n" \
-        "----" "-----------------------------------" "--------------------------------------------------" "------------" "-----------------------------------" "--------------------"
-
-    _count=$(get_item_count)
-    _i=0
-    while [ "$_i" -lt "$_count" ]; do
-        _item=$(get_field "$_i" "item")
-        _itype=$(get_field "$_i" "type")
-        _update_status=$(get_field "$_i" "update")
-        _upgraded_status=$(get_field "$_i" "upgraded")
-        _update_count=$(get_field "$_i" "ucount")
-
-        _display_name=""
-        _display_image=""
-        _status=""
-        _type_str=""
-        _type_color=""
-
-        case "$_itype" in
-            compose:*)
-                _project="${_itype#compose:}"
-                _ccount=$(docker ps -a --filter "label=com.docker.compose.project=$_project" --format "{{.Names}}" | wc -l | tr -d ' ')
-                _first=$(docker ps -a --filter "label=com.docker.compose.project=$_project" --format "{{.Names}}" | head -n 1)
-
-                if [ -n "$_first" ]; then
-                    _status=$(docker inspect --format='{{.State.Status}}' "$_first" 2>/dev/null) || _status="unknown"
-                    _imgs=$(docker ps -a --filter "label=com.docker.compose.project=$_project" --format "{{.Image}}" | sort -u | head -n 2 | tr '\n' ',' | sed 's/,$//')
-
-                    _display_name="$_project"
-                    if [ ${#_display_name} -gt 33 ]; then
-                        _display_name="$(echo "$_display_name" | cut -c1-30)..."
-                    fi
-
-                    _display_image="$_imgs"
-                    if [ "$_ccount" -gt 2 ]; then
-                        _display_image="${_display_image}..."
-                    fi
-                    if [ ${#_display_image} -gt 48 ]; then
-                        _display_image="$(echo "$_display_image" | cut -c1-45)..."
-                    fi
-
-                    _type_str="Compose ($_ccount services)"
-                    _type_color="$CYAN"
-                else
-                    _i=$((_i + 1))
-                    continue
-                fi
-                ;;
-            *)
-                _container="$_item"
-                _img=$(docker inspect --format='{{.Config.Image}}' "$_container" 2>/dev/null) || _img="unknown"
-                _status=$(docker inspect --format='{{.State.Status}}' "$_container" 2>/dev/null) || _status="unknown"
-
-                _display_name="$_container"
-                if [ ${#_display_name} -gt 33 ]; then
-                    _display_name="$(echo "$_display_name" | cut -c1-30)..."
-                fi
-
-                _display_image="$_img"
-                if [ ${#_display_image} -gt 48 ]; then
-                    _display_image="$(echo "$_display_image" | cut -c1-45)..."
-                fi
-
-                _type_str="Standalone"
-                _type_color="$PURPLE"
-                ;;
-        esac
-
-        # Format update column
-        _update_str=""
-        _update_color=""
-
-        if [ "$_upgraded_status" = "yes" ]; then
-            _update_str="  Just upgraded"
-            _update_color="$BLUE"
-        elif [ "$_update_status" = "yes" ]; then
-            if [ -n "$_update_count" ]; then
-                _update_str="  ^ $_update_count need update"
-            else
-                _update_str="  ^ Available"
-            fi
-            _update_color="$YELLOW"
-        elif [ "$_update_status" = "no" ]; then
-            if [ -n "$_update_count" ]; then
-                # Parse X/Y
-                _needs=$(echo "$_update_count" | cut -d'/' -f1)
-                _total=$(echo "$_update_count" | cut -d'/' -f2)
-                if echo "$_needs" | grep -qE '^[0-9]+$' && echo "$_total" | grep -qE '^[0-9]+$'; then
-                    _uptodate=$((_total - _needs))
-                    _update_str="  OK ${_uptodate}/${_total} up to date"
-                else
-                    _update_str="  OK $_update_count up to date"
-                fi
-            else
-                _update_str="  OK Current"
-            fi
-            _update_color="$GREEN"
+            done <<< "$IMAGES"
         else
-            if [ -n "$_update_count" ]; then
-                _update_str="  ... $_update_count"
-            else
-                _update_str="  ..."
+            CONTAINER="$ITEM"
+            IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER" 2>/dev/null)
+            if [ -n "$IMAGE" ]; then
+                check_update_async "$IMAGE"
             fi
-            _update_color="$NC"
         fi
-
-        _num=$((_i + 1))
-        printf "%-4s  " "$_num"
-        printf "${_type_color}%-35s${NC}  " "$_display_name"
-        printf "%-50s  " "$_display_image"
-        printf "%-12s  " "$_status"
-        printf "${_type_color}%-35s${NC}  " "$_type_str"
-        printf "${_update_color}%-20s${NC}\n" "$_update_str"
-
-        _i=$((_i + 1))
     done
 }
 
-# ========== MAIN ==========
-
-printf "${BLUE}=== Docker Container Upgrade Tool ===${NC}\n"
-echo ""
-
-ALL_CONTAINERS=$(docker ps -a --format "{{.Names}}")
-if [ -z "$ALL_CONTAINERS" ]; then
-    echo "No Docker containers found"
-    exit 0
-fi
-
-# Initial scan
-scan_containers
-
-# Start async checks
 if command -v skopeo >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
     echo "Starting background update checks..."
     start_async_checks
     echo ""
 fi
 
-# Main loop
+# ============================================================
+# display_table — uses array_indices(), array_length(), regex_match()
+# ============================================================
+display_table() {
+    echo "Available containers to upgrade:"
+    echo ""
+
+    printf "%-4s  %-35s  %-50s  %-12s  %-35s  %-20s\n" \
+        "No." "Name" "Image" "Status" "Type" "Update"
+
+    printf "%-4s  %-35s  %-50s  %-12s  %-35s  %-20s\n" \
+        "----" "-----------------------------------" "--------------------------------------------------" "------------" "-----------------------------------" "--------------------"
+
+    local i
+    for i in $(array_indices ITEM_ARRAY); do
+        ITEM="${ITEM_ARRAY[$i]}"
+        ITEM_TYPE="${ITEM_TYPE_ARRAY[$i]}"
+
+        if [[ "$ITEM_TYPE" == "compose:"* ]]; then
+            PROJECT_NAME="${ITEM_TYPE#compose:}"
+
+            CONTAINER_COUNT=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format "{{.Names}}" | portable_wc_l)
+
+            FIRST_CONTAINER=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format "{{.Names}}" | head -n 1)
+
+            if [ -n "$FIRST_CONTAINER" ]; then
+                STATUS=$(docker inspect --format='{{.State.Status}}' "$FIRST_CONTAINER")
+
+                IMAGES=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format "{{.Image}}" | sort -u | head -n 2 | tr '\n' ', ' | sed 's/,$//')
+
+                DISPLAY_NAME="$PROJECT_NAME"
+                if [ ${#DISPLAY_NAME} -gt 33 ]; then
+                    DISPLAY_NAME="${DISPLAY_NAME:0:30}..."
+                fi
+
+                DISPLAY_IMAGE="$IMAGES"
+                if [ $CONTAINER_COUNT -gt 2 ]; then
+                    DISPLAY_IMAGE="$DISPLAY_IMAGE..."
+                fi
+                if [ ${#DISPLAY_IMAGE} -gt 48 ]; then
+                    DISPLAY_IMAGE="${DISPLAY_IMAGE:0:45}..."
+                fi
+
+                TYPE_STR="📦 Compose ($CONTAINER_COUNT services)"
+                if [ ${#TYPE_STR} -gt 33 ]; then
+                    TYPE_STR="📦 Compose ($CONTAINER_COUNT svc)"
+                fi
+                TYPE_COLOR="${CYAN}"
+            else
+                continue
+            fi
+        else
+            CONTAINER="$ITEM"
+            IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER")
+            STATUS=$(docker inspect --format='{{.State.Status}}' "$CONTAINER")
+
+            DISPLAY_NAME="$CONTAINER"
+            if [ ${#DISPLAY_NAME} -gt 33 ]; then
+                DISPLAY_NAME="${DISPLAY_NAME:0:30}..."
+            fi
+
+            DISPLAY_IMAGE="$IMAGE"
+            if [ ${#DISPLAY_IMAGE} -gt 48 ]; then
+                DISPLAY_IMAGE="${DISPLAY_IMAGE:0:45}..."
+            fi
+
+            TYPE_STR="🐳 Standalone"
+            TYPE_COLOR="${PURPLE}"
+        fi
+
+        UPDATE_STATUS="${UPDATE_AVAILABLE_ARRAY[$i]}"
+        UPGRADED_STATUS="${RECENTLY_UPGRADED_ARRAY[$i]}"
+        UPDATE_COUNT="${UPDATE_COUNT_ARRAY[$i]}"
+
+        if [ "$UPGRADED_STATUS" = "yes" ]; then
+            UPDATE_STR="  🔄 Just upgraded"
+            UPDATE_COLOR="${BLUE}"
+        elif [ "$UPDATE_STATUS" = "yes" ]; then
+            if [ -n "$UPDATE_COUNT" ]; then
+                UPDATE_STR="  ⬆ $UPDATE_COUNT need update"
+            else
+                UPDATE_STR="  ⬆ Available"
+            fi
+            UPDATE_COLOR="${YELLOW}"
+        elif [ "$UPDATE_STATUS" = "no" ]; then
+            if [ -n "$UPDATE_COUNT" ]; then
+                # ★ Uses regex_match() helper instead of bare [[ =~ ]]
+                if regex_match "$UPDATE_COUNT" '^([0-9]+)/([0-9]+)$'; then
+                    NEEDS_UPDATE="${BASH_REMATCH[1]}"
+                    TOTAL="${BASH_REMATCH[2]}"
+                    UP_TO_DATE=$((TOTAL - NEEDS_UPDATE))
+                    UPDATE_STR="  ✓ $UP_TO_DATE/$TOTAL up to date"
+                else
+                    UPDATE_STR="  ✓ $UPDATE_COUNT up to date"
+                fi
+            else
+                UPDATE_STR="  ✓ Current"
+            fi
+            UPDATE_COLOR="${GREEN}"
+        else
+            if [ -n "$UPDATE_COUNT" ]; then
+                UPDATE_STR="  ... $UPDATE_COUNT"
+            else
+                UPDATE_STR="  ..."
+            fi
+            UPDATE_COLOR="${NC}"
+        fi
+
+        NUM_COL="$((i+1))"
+        printf "%-4s  " "$NUM_COL"
+        printf "${TYPE_COLOR}%-35s${NC}  " "$DISPLAY_NAME"
+        printf "%-50s  " "$DISPLAY_IMAGE"
+        printf "%-12s  " "$STATUS"
+        printf "${TYPE_COLOR}%-35s${NC}  " "$TYPE_STR"
+        printf "${UPDATE_COLOR}%-20s${NC}\n" "$UPDATE_STR"
+    done
+}
+
+# ============================================================
+# reload_cache_status — uses array_indices()
+# ============================================================
+reload_cache_status() {
+    local i
+    for i in $(array_indices ITEM_ARRAY); do
+        ITEM="${ITEM_ARRAY[$i]}"
+        ITEM_TYPE="${ITEM_TYPE_ARRAY[$i]}"
+
+        if [[ "$ITEM_TYPE" == "compose:"* ]]; then
+            PROJECT_NAME="${ITEM_TYPE#compose:}"
+            IMAGES=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format "{{.Image}}" | sort -u)
+
+            HAS_UPDATE=false
+            HAS_CACHED_DATA=false
+            UPDATE_COUNT=0
+            TOTAL_COUNT=0
+
+            while IFS= read -r image; do
+                if [ -z "$image" ]; then continue; fi
+                cache_file=$(get_cache_file "$image")
+                TOTAL_COUNT=$((TOTAL_COUNT + 1))
+
+                if is_cache_valid "$cache_file"; then
+                    HAS_CACHED_DATA=true
+                    cached_result=$(read_cache "$cache_file")
+                    if [ "$cached_result" = "0" ]; then
+                        HAS_UPDATE=true
+                        UPDATE_COUNT=$((UPDATE_COUNT + 1))
+                    fi
+                fi
+            done <<< "$IMAGES"
+
+            UPDATE_COUNT_ARRAY[$i]="$UPDATE_COUNT/$TOTAL_COUNT"
+
+            if [ "$HAS_CACHED_DATA" = true ]; then
+                if [ "$HAS_UPDATE" = true ]; then
+                    UPDATE_AVAILABLE_ARRAY[$i]="yes"
+                else
+                    UPDATE_AVAILABLE_ARRAY[$i]="no"
+                fi
+            fi
+        else
+            CONTAINER="$ITEM"
+            IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER" 2>/dev/null)
+
+            if [ -n "$IMAGE" ]; then
+                cache_file=$(get_cache_file "$IMAGE")
+                if is_cache_valid "$cache_file"; then
+                    cached_result=$(read_cache "$cache_file")
+                    if [ "$cached_result" = "0" ]; then
+                        UPDATE_AVAILABLE_ARRAY[$i]="yes"
+                        UPDATE_COUNT_ARRAY[$i]="1/1"
+                    elif [ "$cached_result" = "1" ]; then
+                        UPDATE_AVAILABLE_ARRAY[$i]="no"
+                        UPDATE_COUNT_ARRAY[$i]="0/1"
+                    elif [ "$cached_result" = "2" ]; then
+                        UPDATE_AVAILABLE_ARRAY[$i]="unknown"
+                        UPDATE_COUNT_ARRAY[$i]="?/1"
+                    fi
+                else
+                    UPDATE_COUNT_ARRAY[$i]="?/1"
+                fi
+            else
+                UPDATE_COUNT_ARRAY[$i]="?/1"
+            fi
+        fi
+    done
+}
+
+# ============================================================
+# portable_read_prompt - handles read -p/-n differences
+# ============================================================
+# bash:  read -p "prompt" -n 1 -r REPLY
+# zsh:   read "REPLY?prompt" -k 1
+portable_read_prompt() {
+    local prompt="$1"
+    local single_char="${2:-false}"
+
+    if [ "$CURRENT_SHELL" = "zsh" ]; then
+        if [ "$single_char" = "true" ]; then
+            read -k 1 "REPLY?${prompt}"
+            echo  # newline after single char
+        else
+            read "REPLY?${prompt}"
+        fi
+    else
+        if [ "$single_char" = "true" ]; then
+            read -p "$prompt" -n 1 -r REPLY
+            echo
+        else
+            read -p "$prompt" -r REPLY
+        fi
+    fi
+}
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
 while true; do
     echo ""
+
     reload_cache_status
     display_table
 
     echo ""
     echo "Options:"
     echo "  1) Select container to upgrade"
-    _cache_mins=$(awk "BEGIN {val=$CACHE_VALIDITY_SECONDS/60; if (val == int(val)) printf \"%d\", val; else printf \"%.1f\", val}")
-    echo "  2) Check for updates (uses ${_cache_mins} min cache if available)"
+    CACHE_MINS=$(awk "BEGIN {val=$CACHE_VALIDITY_SECONDS/60; if (val == int(val)) printf \"%d\", val; else printf \"%.1f\", val}")
+    echo "  2) Check for updates (uses ${CACHE_MINS} min cache if available)"
     echo "  3) Force check for updates (ignores cache)"
     echo "  4) Reload update status from cache"
     echo "  q) Quit"
     echo ""
-    printf "Select option: "
-    read -r CHECK_OPTION
+    portable_read_prompt "Select option: "
+    CHECK_OPTION="$REPLY"
 
-    case "$CHECK_OPTION" in
-        q|Q)
-            echo "Exiting..."
-            exit 0
-            ;;
+    if [ "$CHECK_OPTION" = "q" ] || [ "$CHECK_OPTION" = "Q" ]; then
+        echo "Exiting..."
+        exit 0
+    fi
 
-        4)
-            echo ""
-            echo "Reloading update status from cache..."
-            echo ""
+    if [ "$CHECK_OPTION" = "4" ]; then
+        echo ""
+        echo "Reloading update status from cache..."
+        echo ""
 
-            _count=$(get_item_count)
-            _i=0
-            while [ "$_i" -lt "$_count" ]; do
-                _item=$(get_field "$_i" "item")
-                _itype=$(get_field "$_i" "type")
+        local_i=0
+        for local_i in $(array_indices ITEM_ARRAY); do
+            ITEM="${ITEM_ARRAY[$local_i]}"
+            ITEM_TYPE="${ITEM_TYPE_ARRAY[$local_i]}"
 
-                case "$_itype" in
-                    compose:*)
-                        _project="${_itype#compose:}"
-                        _images=$(docker ps -a --filter "label=com.docker.compose.project=$_project" --format "{{.Image}}" | sort -u)
+            if [[ "$ITEM_TYPE" == "compose:"* ]]; then
+                PROJECT_NAME="${ITEM_TYPE#compose:}"
+                IMAGES=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format "{{.Image}}" | sort -u)
 
-                        _has_update=false
-                        _has_cached=false
-
-                        # Use temp file for subshell results
-                        echo "false" > "$DATA_DIR/tmp_hu"
-                        echo "false" > "$DATA_DIR/tmp_hc"
-
-                        echo "$_images" | while IFS= read -r _img; do
-                            if [ -n "$_img" ]; then
-                                _cf=$(get_cache_file "$_img")
-                                if is_cache_valid "$_cf"; then
-                                    echo "true" > "$DATA_DIR/tmp_hc"
-                                    _cr=$(read_cache "$_cf")
-                                    if [ "$_cr" = "0" ]; then
-                                        echo "true" > "$DATA_DIR/tmp_hu"
-                                    fi
-                                fi
-                            fi
-                        done
-
-                        _has_update=$(cat "$DATA_DIR/tmp_hu")
-                        _has_cached=$(cat "$DATA_DIR/tmp_hc")
-                        rm -f "$DATA_DIR/tmp_hu" "$DATA_DIR/tmp_hc"
-
-                        if [ "$_has_cached" = "true" ]; then
-                            if [ "$_has_update" = "true" ]; then
-                                set_field "$_i" "update" "yes"
-                            else
-                                set_field "$_i" "update" "no"
-                            fi
-                        else
-                            set_field "$_i" "update" "unknown"
-                        fi
-                        ;;
-                    *)
-                        _container="$_item"
-                        _img=$(docker inspect --format='{{.Config.Image}}' "$_container" 2>/dev/null) || _img=""
-                        if [ -n "$_img" ]; then
-                            _cf=$(get_cache_file "$_img")
-                            if is_cache_valid "$_cf"; then
-                                _cr=$(read_cache "$_cf")
-                                if [ "$_cr" = "0" ]; then
-                                    set_field "$_i" "update" "yes"
-                                elif [ "$_cr" = "1" ]; then
-                                    set_field "$_i" "update" "no"
-                                else
-                                    set_field "$_i" "update" "unknown"
-                                fi
-                            else
-                                set_field "$_i" "update" "unknown"
-                            fi
-                        else
-                            set_field "$_i" "update" "unknown"
-                        fi
-                        ;;
-                esac
-
-                set_field "$_i" "upgraded" "no"
-                _i=$((_i + 1))
-            done
-
-            printf "${GREEN}✓ Update status reloaded from cache${NC}\n"
-            echo ""
-            continue
-            ;;
-
-        2|3)
-            IGNORE_CACHE=false
-            if [ "$CHECK_OPTION" = "3" ]; then
-                IGNORE_CACHE=true
-                echo ""
-                printf "${YELLOW}Force checking (ignoring cache)...${NC}\n"
-            fi
-
-            if ! command -v skopeo >/dev/null 2>&1; then
-                echo ""
-                printf "${RED}Error: skopeo is not installed${NC}\n"
-                echo ""
-                echo "skopeo is required to check for updates without pulling images."
-                echo ""
-                echo "To install skopeo, run:"
-                printf "${GREEN}  sudo apt-get install skopeo${NC}\n"
-                echo ""
-                echo "Or on other systems:"
-                echo "  - Fedora/RHEL: sudo dnf install skopeo"
-                echo "  - macOS: brew install skopeo"
-                echo ""
-                printf "Press Enter to return to main menu..."
-                read -r _dummy
-                continue
-            fi
-
-            if ! command -v jq >/dev/null 2>&1; then
-                echo ""
-                printf "${RED}Error: jq is not installed${NC}\n"
-                echo ""
-                echo "jq is required to parse skopeo output."
-                echo ""
-                printf "Press Enter to return to main menu..."
-                read -r _dummy
-                continue
-            fi
-
-            echo ""
-            echo "Checking Docker registry authentication..."
-            if ! check_docker_auth; then
-                printf "${YELLOW}⚠️  Not authenticated with Docker Hub${NC}\n"
-                prompt_docker_login
-            else
-                printf "${GREEN}✓ Authenticated with Docker Hub${NC}\n"
-            fi
-
-            echo ""
-            echo "Checking for updates..."
-            echo ""
-
-            _count=$(get_item_count)
-            _i=0
-            while [ "$_i" -lt "$_count" ]; do
-                _item=$(get_field "$_i" "item")
-                _itype=$(get_field "$_i" "type")
-
-                printf "[$((_i + 1))/${_count}] Checking %s... " "$_item"
-
-                case "$_itype" in
-                    compose:*)
-                        _project="${_itype#compose:}"
-                        _images=$(docker ps -a --filter "label=com.docker.compose.project=$_project" --format "{{.Image}}" | sort -u)
-                        _image_count=$(echo "$_images" | wc -l | tr -d ' ')
-
-                        echo ""
-                        echo "  Checking $_image_count images for $_project:"
-
-                        _has_update=false
-                        _up_cnt=0
-                        _tot_cnt=0
-                        _img_num=0
-
-                        # Use temp files for subshell
-                        echo "false" > "$DATA_DIR/tmp_hu2"
-                        echo "0" > "$DATA_DIR/tmp_uc2"
-                        echo "0" > "$DATA_DIR/tmp_tc2"
-                        echo "0" > "$DATA_DIR/tmp_in2"
-
-                        # Process images without subshell using temp file
-                        _imgfile="$DATA_DIR/tmp_imglist"
-                        echo "$_images" > "$_imgfile"
-                        while IFS= read -r _img; do
-                            if [ -z "$_img" ]; then continue; fi
-                            _img_num=$(cat "$DATA_DIR/tmp_in2")
-                            _img_num=$((_img_num + 1))
-                            echo "$_img_num" > "$DATA_DIR/tmp_in2"
-
-                            _tot_cnt=$(cat "$DATA_DIR/tmp_tc2")
-                            _tot_cnt=$((_tot_cnt + 1))
-                            echo "$_tot_cnt" > "$DATA_DIR/tmp_tc2"
-
-                            printf "    [%s/%s] %s... " "$_img_num" "$_image_count" "$_img"
-
-                            if check_update_available "$_img"; then
-                                echo "true" > "$DATA_DIR/tmp_hu2"
-                                _up_cnt=$(cat "$DATA_DIR/tmp_uc2")
-                                _up_cnt=$((_up_cnt + 1))
-                                echo "$_up_cnt" > "$DATA_DIR/tmp_uc2"
-                                printf "${YELLOW}UPDATE AVAILABLE${NC}\n"
-                            elif [ $? -eq 1 ]; then
-                                printf "${GREEN}UP TO DATE${NC}\n"
-                            else
-                                echo "UNABLE TO CHECK"
-                            fi
-                        done < "$_imgfile"
-
-                        _has_update=$(cat "$DATA_DIR/tmp_hu2")
-                        _up_cnt=$(cat "$DATA_DIR/tmp_uc2")
-                        _tot_cnt=$(cat "$DATA_DIR/tmp_tc2")
-                        rm -f "$DATA_DIR"/tmp_hu2 "$DATA_DIR"/tmp_uc2 "$DATA_DIR"/tmp_tc2 "$DATA_DIR"/tmp_in2 "$_imgfile"
-
-                        set_field "$_i" "ucount" "${_up_cnt}/${_tot_cnt}"
-
-                        printf "[$((_i + 1))/${_count}] %s overall: " "$_item"
-                        if [ "$_has_update" = "true" ]; then
-                            set_field "$_i" "update" "yes"
-                            printf "${YELLOW}UPDATE AVAILABLE${NC}\n"
-                        else
-                            set_field "$_i" "update" "no"
-                            printf "${GREEN}UP TO DATE${NC}\n"
-                        fi
-                        set_field "$_i" "upgraded" "no"
-                        ;;
-                    *)
-                        _container="$_item"
-                        _img=$(docker inspect --format='{{.Config.Image}}' "$_container" 2>/dev/null) || _img=""
-
-                        if check_update_available "$_img"; then
-                            set_field "$_i" "update" "yes"
-                            printf "${YELLOW}UPDATE AVAILABLE${NC}\n"
-                        elif [ $? -eq 1 ]; then
-                            set_field "$_i" "update" "no"
-                            printf "${GREEN}UP TO DATE${NC}\n"
-                        else
-                            set_field "$_i" "update" "unknown"
-                            echo "UNABLE TO CHECK"
-                        fi
-                        set_field "$_i" "upgraded" "no"
-                        ;;
-                esac
-
-                sleep 1 2>/dev/null || true
-                _i=$((_i + 1))
-            done
-
-            echo ""
-            echo "Update check complete!"
-            echo ""
-            continue
-            ;;
-
-        1)
-            echo ""
-            printf "Select number to upgrade (or 'q' to cancel): "
-            read -r SELECTION
-
-            case "$SELECTION" in
-                q|Q) continue ;;
-            esac
-
-            # Validate selection is numeric
-            if ! echo "$SELECTION" | grep -qE '^[0-9]+$'; then
-                printf "${RED}Error: Invalid selection${NC}\n"
-                printf "Press Enter to continue..."
-                read -r _dummy
-                continue
-            fi
-
-            _count=$(get_item_count)
-            if [ "$SELECTION" -lt 1 ] || [ "$SELECTION" -gt "$_count" ]; then
-                printf "${RED}Error: Invalid selection${NC}\n"
-                printf "Press Enter to continue..."
-                read -r _dummy
-                continue
-            fi
-
-            SELECTED_INDEX=$((SELECTION - 1))
-            SELECTED_ITEM=$(get_field "$SELECTED_INDEX" "item")
-            SELECTED_TYPE=$(get_field "$SELECTED_INDEX" "type")
-
-            echo ""
-            printf "${BLUE}=== Upgrading: %s ===${NC}\n" "$SELECTED_ITEM"
-            echo ""
-
-            case "$SELECTED_TYPE" in
-                compose:*)
-                    PROJECT_NAME="${SELECTED_TYPE#compose:}"
-                    printf "Type: ${CYAN}Docker Compose${NC}\n"
-
-                    COMPOSE_DIR=$(get_field "$PROJECT_NAME" "composedir")
-                    COMPOSE_FILE=$(get_field "$PROJECT_NAME" "composefile")
-
-                    echo "Project: $PROJECT_NAME"
-                    echo "Directory: $COMPOSE_DIR"
-                    echo "Config files: $COMPOSE_FILE"
-
-                    echo ""
-                    echo "Services in this project:"
-                    docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format "  - {{.Names}} ({{.Image}})"
-                    echo ""
-
-                    if [ -z "$COMPOSE_DIR" ] || [ ! -d "$COMPOSE_DIR" ]; then
-                        printf "${RED}Cannot find compose directory automatically${NC}\n"
-                        printf "Enter the compose directory path: "
-                        read -r COMPOSE_DIR
-
-                        if [ ! -d "$COMPOSE_DIR" ]; then
-                            printf "${RED}Directory not found: %s${NC}\n" "$COMPOSE_DIR"
-                            printf "Press Enter to continue..."
-                            read -r _dummy
-                            continue
+                HAS_UPDATE=false
+                HAS_CACHED_DATA=false
+                while IFS= read -r image; do
+                    if [ -z "$image" ]; then continue; fi
+                    cache_file=$(get_cache_file "$image")
+                    if is_cache_valid "$cache_file"; then
+                        HAS_CACHED_DATA=true
+                        cached_result=$(read_cache "$cache_file")
+                        if [ "$cached_result" = "0" ]; then
+                            HAS_UPDATE=true
                         fi
                     fi
+                done <<< "$IMAGES"
 
-                    if [ -z "$COMPOSE_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; then
-                        COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
-                        if [ ! -f "$COMPOSE_FILE" ]; then
-                            COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yaml"
-                            if [ ! -f "$COMPOSE_FILE" ]; then
-                                printf "${RED}No docker-compose.yml found in %s${NC}\n" "$COMPOSE_DIR"
-                                printf "Press Enter to continue..."
-                                read -r _dummy
-                                continue
-                            fi
-                        fi
-                    fi
-
-                    printf "${GREEN}✓ Found compose file: %s${NC}\n" "$COMPOSE_FILE"
-                    echo ""
-
-                    if command -v docker-compose >/dev/null 2>&1; then
-                        COMPOSE_CMD="docker-compose"
-                    elif docker compose version >/dev/null 2>&1; then
-                        COMPOSE_CMD="docker compose"
+                if [ "$HAS_CACHED_DATA" = true ]; then
+                    if [ "$HAS_UPDATE" = true ]; then
+                        UPDATE_AVAILABLE_ARRAY[$local_i]="yes"
                     else
-                        printf "${RED}Neither 'docker-compose' nor 'docker compose' found${NC}\n"
-                        printf "Press Enter to continue..."
-                        read -r _dummy
+                        UPDATE_AVAILABLE_ARRAY[$local_i]="no"
+                    fi
+                else
+                    UPDATE_AVAILABLE_ARRAY[$local_i]="unknown"
+                fi
+            else
+                CONTAINER="$ITEM"
+                IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER" 2>/dev/null)
+
+                if [ -n "$IMAGE" ]; then
+                    cache_file=$(get_cache_file "$IMAGE")
+                    if is_cache_valid "$cache_file"; then
+                        cached_result=$(read_cache "$cache_file")
+                        if [ "$cached_result" = "0" ]; then
+                            UPDATE_AVAILABLE_ARRAY[$local_i]="yes"
+                        elif [ "$cached_result" = "1" ]; then
+                            UPDATE_AVAILABLE_ARRAY[$local_i]="no"
+                        else
+                            UPDATE_AVAILABLE_ARRAY[$local_i]="unknown"
+                        fi
+                    else
+                        UPDATE_AVAILABLE_ARRAY[$local_i]="unknown"
+                    fi
+                else
+                    UPDATE_AVAILABLE_ARRAY[$local_i]="unknown"
+                fi
+            fi
+
+            RECENTLY_UPGRADED_ARRAY[$local_i]="no"
+        done
+
+        echo -e "${GREEN}✓ Update status reloaded from cache${NC}"
+        echo ""
+        continue
+    fi
+
+    if [ "$CHECK_OPTION" = "2" ] || [ "$CHECK_OPTION" = "3" ]; then
+        IGNORE_CACHE=false
+        if [ "$CHECK_OPTION" = "3" ]; then
+            IGNORE_CACHE=true
+            echo ""
+            echo -e "${YELLOW}Force checking (ignoring cache)...${NC}"
+        fi
+
+        if ! command -v skopeo >/dev/null 2>&1; then
+            echo ""
+            echo -e "${RED}❌ Error: skopeo is not installed${NC}"
+            echo ""
+            echo "skopeo is required to check for updates without pulling images."
+            echo ""
+            echo "To install skopeo:"
+            case "$PLATFORM" in
+                macos)
+                    echo -e "${GREEN}  brew install skopeo${NC}"
+                    ;;
+                linux)
+                    echo -e "${GREEN}  sudo apt-get install skopeo${NC}"
+                    echo ""
+                    echo "Or on other distros:"
+                    echo "  - Fedora/RHEL: sudo dnf install skopeo"
+                    ;;
+                *)
+                    echo -e "${GREEN}  sudo apt-get install skopeo${NC}"
+                    echo "  - macOS: brew install skopeo"
+                    echo "  - Fedora/RHEL: sudo dnf install skopeo"
+                    ;;
+            esac
+            echo ""
+            portable_read_prompt "Press Enter to return to main menu..."
+            continue
+        fi
+
+        if ! command -v jq >/dev/null 2>&1; then
+            echo ""
+            echo -e "${RED}❌ Error: jq is not installed${NC}"
+            echo ""
+            echo "jq is required to parse skopeo output."
+            echo ""
+            echo "To install jq:"
+            case "$PLATFORM" in
+                macos) echo -e "${GREEN}  brew install jq${NC}" ;;
+                linux) echo -e "${GREEN}  sudo apt-get install jq${NC}" ;;
+                *)     echo -e "${GREEN}  sudo apt-get install jq${NC}" ;;
+            esac
+            echo ""
+            portable_read_prompt "Press Enter to return to main menu..."
+            continue
+        fi
+
+        echo ""
+        echo "Checking Docker registry authentication..."
+        if ! check_docker_auth; then
+            echo -e "${YELLOW}⚠️  Not authenticated with Docker Hub${NC}"
+            prompt_docker_login
+        else
+            echo -e "${GREEN}✓ Authenticated with Docker Hub${NC}"
+        fi
+
+        echo ""
+        echo "Checking for updates..."
+        echo ""
+
+        ITEM_COUNT=$(array_length ITEM_ARRAY)
+        for i in $(array_indices ITEM_ARRAY); do
+            ITEM="${ITEM_ARRAY[$i]}"
+            ITEM_TYPE="${ITEM_TYPE_ARRAY[$i]}"
+
+            echo -n "[$((i+1))/${ITEM_COUNT}] Checking $ITEM... "
+
+            if [[ "$ITEM_TYPE" == "compose:"* ]]; then
+                PROJECT_NAME="${ITEM_TYPE#compose:}"
+                IMAGES=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format "{{.Image}}" | sort -u)
+
+                IMAGE_COUNT=$(echo "$IMAGES" | portable_wc_l)
+                echo ""
+                echo "  Checking $IMAGE_COUNT images for $PROJECT_NAME:"
+
+                HAS_UPDATE=false
+                UPDATE_COUNT=0
+                TOTAL_COUNT=0
+                IMG_NUM=0
+                while IFS= read -r image; do
+                    if [ -z "$image" ]; then continue; fi
+                    IMG_NUM=$((IMG_NUM + 1))
+                    TOTAL_COUNT=$((TOTAL_COUNT + 1))
+                    echo -n "    [$IMG_NUM/$IMAGE_COUNT] $image... "
+
+                    if check_update_available "$image"; then
+                        HAS_UPDATE=true
+                        UPDATE_COUNT=$((UPDATE_COUNT + 1))
+                        echo -e "${YELLOW}UPDATE AVAILABLE${NC}"
+                    elif [ $? -eq 1 ]; then
+                        echo -e "${GREEN}UP TO DATE${NC}"
+                    else
+                        echo "UNABLE TO CHECK"
+                    fi
+                done <<< "$IMAGES"
+
+                UPDATE_COUNT_ARRAY[$i]="$UPDATE_COUNT/$TOTAL_COUNT"
+
+                echo -n "[$((i+1))/${ITEM_COUNT}] $ITEM overall: "
+                if [ "$HAS_UPDATE" = true ]; then
+                    UPDATE_AVAILABLE_ARRAY[$i]="yes"
+                    echo -e "${YELLOW}UPDATE AVAILABLE${NC}"
+                else
+                    UPDATE_AVAILABLE_ARRAY[$i]="no"
+                    echo -e "${GREEN}UP TO DATE${NC}"
+                fi
+
+                RECENTLY_UPGRADED_ARRAY[$i]="no"
+            else
+                CONTAINER="$ITEM"
+                IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER")
+
+                if check_update_available "$IMAGE"; then
+                    UPDATE_AVAILABLE_ARRAY[$i]="yes"
+                    echo -e "${YELLOW}UPDATE AVAILABLE${NC}"
+                elif [ $? -eq 1 ]; then
+                    UPDATE_AVAILABLE_ARRAY[$i]="no"
+                    echo -e "${GREEN}UP TO DATE${NC}"
+                else
+                    UPDATE_AVAILABLE_ARRAY[$i]="unknown"
+                    echo "UNABLE TO CHECK"
+                fi
+
+                RECENTLY_UPGRADED_ARRAY[$i]="no"
+            fi
+
+            sleep 0.1
+        done
+
+        echo ""
+        echo "Update check complete! Refreshing table..."
+        sleep 1
+
+        lines_to_clear=$((ITEM_COUNT + 5))
+        portable_tput_clear_lines $lines_to_clear
+
+        echo ""
+        continue
+    fi
+
+    if [ "$CHECK_OPTION" = "1" ]; then
+        echo ""
+        portable_read_prompt "Select number to upgrade (or 'q' to cancel): "
+        SELECTION="$REPLY"
+
+        if [ "$SELECTION" = "q" ] || [ "$SELECTION" = "Q" ]; then
+            continue
+        fi
+
+        ITEM_COUNT=$(array_length ITEM_ARRAY)
+        if ! echo "$SELECTION" | grep -qE '^[0-9]+$' || [ "$SELECTION" -lt 1 ] || [ "$SELECTION" -gt "$ITEM_COUNT" ]; then
+            echo -e "${RED}Error: Invalid selection${NC}"
+            portable_read_prompt "Press Enter to continue..."
+            continue
+        fi
+
+        SELECTED_ITEM="${ITEM_ARRAY[$((SELECTION-1))]}"
+        SELECTED_TYPE="${ITEM_TYPE_ARRAY[$((SELECTION-1))]}"
+        SELECTED_INDEX=$((SELECTION-1))
+
+        echo ""
+        echo -e "${BLUE}=== Upgrading: $SELECTED_ITEM ===${NC}"
+        echo ""
+
+        if [[ "$SELECTED_TYPE" == "compose:"* ]]; then
+            PROJECT_NAME="${SELECTED_TYPE#compose:}"
+            echo -e "Type: 📦 ${CYAN}Docker Compose${NC}"
+
+            COMPOSE_DIR="${COMPOSE_DIRS[$PROJECT_NAME]}"
+            COMPOSE_FILE="${COMPOSE_FILES[$PROJECT_NAME]}"
+
+            echo "Project: $PROJECT_NAME"
+            echo "Directory: $COMPOSE_DIR"
+            echo "Config files: $COMPOSE_FILE"
+
+            echo ""
+            echo "Services in this project:"
+            docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format "  - {{.Names}} ({{.Image}})"
+            echo ""
+
+            if [ -z "$COMPOSE_DIR" ] || [ ! -d "$COMPOSE_DIR" ]; then
+                echo -e "${RED}⚠️  Cannot find compose directory automatically${NC}"
+                portable_read_prompt "Enter the compose directory path: "
+                COMPOSE_DIR="$REPLY"
+
+                if [ ! -d "$COMPOSE_DIR" ]; then
+                    echo -e "${RED}❌ Directory not found: $COMPOSE_DIR${NC}"
+                    portable_read_prompt "Press Enter to continue..."
+                    continue
+                fi
+            fi
+
+            if [ -z "$COMPOSE_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; then
+                COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
+                if [ ! -f "$COMPOSE_FILE" ]; then
+                    COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yaml"
+                    if [ ! -f "$COMPOSE_FILE" ]; then
+                        echo -e "${RED}❌ No docker-compose.yml found in $COMPOSE_DIR${NC}"
+                        portable_read_prompt "Press Enter to continue..."
                         continue
                     fi
+                fi
+            fi
 
-                    echo "Using command: $COMPOSE_CMD"
-                    echo ""
+            echo -e "${GREEN}✓ Found compose file: $COMPOSE_FILE${NC}"
+            echo ""
 
-                    printf "Pull images and recreate ALL services in this project? (y/n) "
-                    read -r REPLY
-                    case "$REPLY" in
-                        [Yy]|[Yy][Ee][Ss]) ;;
-                        *)
-                            echo "Cancelled."
-                            printf "Press Enter to continue..."
-                            read -r _dummy
-                            continue
-                            ;;
-                    esac
+            if command -v docker-compose >/dev/null 2>&1; then
+                COMPOSE_CMD="docker-compose"
+            elif docker compose version >/dev/null 2>&1; then
+                COMPOSE_CMD="docker compose"
+            else
+                echo -e "${RED}❌ Neither 'docker-compose' nor 'docker compose' found${NC}"
+                portable_read_prompt "Press Enter to continue..."
+                continue
+            fi
 
-                    echo ""
-                    printf "${BLUE}=== Pulling latest images ===${NC}\n"
-                    cd "$COMPOSE_DIR"
-                    $COMPOSE_CMD pull
+            echo "Using command: $COMPOSE_CMD"
+            echo ""
 
-                    echo ""
-                    printf "${BLUE}=== Recreating all services ===${NC}\n"
-                    $COMPOSE_CMD up -d --force-recreate
+            portable_read_prompt "Pull images and recreate ALL services in this project? (y/n) " true
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                echo "Cancelled."
+                portable_read_prompt "Press Enter to continue..."
+                continue
+            fi
 
-                    echo ""
-                    printf "${GREEN}=== Upgrade complete! ===${NC}\n"
-                    docker ps --filter "label=com.docker.compose.project=$PROJECT_NAME"
+            echo ""
+            echo -e "${BLUE}=== Pulling latest images ===${NC}"
+            cd "$COMPOSE_DIR"
+            $COMPOSE_CMD pull
 
-                    set_field "$SELECTED_INDEX" "upgraded" "yes"
-                    set_field "$SELECTED_INDEX" "update" "unknown"
+            echo ""
+            echo -e "${BLUE}=== Recreating all services ===${NC}"
+            $COMPOSE_CMD up -d --force-recreate
 
-                    scan_containers
-                    echo ""
-                    continue
-                    ;;
+            echo ""
+            echo -e "${GREEN}=== Upgrade complete! ===${NC}"
+            docker ps --filter "label=com.docker.compose.project=$PROJECT_NAME"
 
-                *)
-                    CONTAINER_NAME="$SELECTED_ITEM"
-                    printf "Type: ${PURPLE}Standalone${NC}\n"
-                    echo ""
+            RECENTLY_UPGRADED_ARRAY[$SELECTED_INDEX]="yes"
+            UPDATE_AVAILABLE_ARRAY[$SELECTED_INDEX]="unknown"
 
-                    IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME")
-                    echo "Image: $IMAGE"
-                    echo ""
+            scan_containers
 
-                    PORTS=$(docker inspect --format='{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{range $conf}}-p {{.HostIP}}{{if .HostIP}}:{{end}}{{.HostPort}}:{{$p}} {{end}}{{end}}{{end}}' "$CONTAINER_NAME")
-                    VOLUMES=$(docker inspect --format='{{range .Mounts}}-v {{.Source}}:{{.Destination}}{{if .Mode}}:{{.Mode}}{{end}} {{end}}' "$CONTAINER_NAME")
-                    ENV_VARS=$(docker inspect --format='{{range .Config.Env}}-e "{{.}}" {{end}}' "$CONTAINER_NAME")
+            echo ""
+            continue
 
-                    RESTART=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME")
-                    RESTART_FLAG=""
-                    if [ "$RESTART" != "no" ] && [ -n "$RESTART" ]; then
-                        RESTART_FLAG="--restart=$RESTART"
-                    fi
+        else
+            CONTAINER_NAME="$SELECTED_ITEM"
+            echo -e "Type: 🐳 ${PURPLE}Standalone${NC}"
+            echo ""
 
-                    NETWORK=$(docker inspect --format='{{.HostConfig.NetworkMode}}' "$CONTAINER_NAME")
-                    NETWORK_FLAG=""
-                    if [ "$NETWORK" != "default" ] && [ -n "$NETWORK" ]; then
-                        NETWORK_FLAG="--network=$NETWORK"
-                    fi
+            IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME")
+            echo "Image: $IMAGE"
+            echo ""
 
-                    PRIVILEGED=$(docker inspect --format='{{.HostConfig.Privileged}}' "$CONTAINER_NAME")
-                    PRIVILEGED_FLAG=""
-                    if [ "$PRIVILEGED" = "true" ]; then
-                        PRIVILEGED_FLAG="--privileged"
-                    fi
+            PORTS=$(docker inspect --format='{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{range $conf}}-p {{.HostIP}}{{if .HostIP}}:{{end}}{{.HostPort}}:{{$p}} {{end}}{{end}}{{end}}' "$CONTAINER_NAME")
 
-                    RUN_CMD="docker run -d --name $CONTAINER_NAME $RESTART_FLAG $NETWORK_FLAG $PRIVILEGED_FLAG $PORTS $VOLUMES $ENV_VARS $IMAGE"
+            VOLUMES=$(docker inspect --format='{{range .Mounts}}-v {{.Source}}:{{.Destination}}{{if .Mode}}:{{.Mode}}{{end}} {{end}}' "$CONTAINER_NAME")
 
-                    printf "${BLUE}=== Current configuration ===${NC}\n"
-                    echo "$RUN_CMD"
-                    echo ""
+            ENV_VARS=$(docker inspect --format='{{range .Config.Env}}-e "{{.}}" {{end}}' "$CONTAINER_NAME")
 
-                    printf "${BLUE}=== Volumes to preserve ===${NC}\n"
-                    if [ -z "$VOLUMES" ]; then
-                        printf "${RED}  (none - WARNING: container may not persist data!)${NC}\n"
-                    else
-                        docker inspect --format='{{range .Mounts}}  {{.Source}} -> {{.Destination}} ({{.Type}}){{println}}{{end}}' "$CONTAINER_NAME"
-                    fi
-                    echo ""
+            RESTART=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER_NAME")
+            if [ "$RESTART" != "no" ] && [ -n "$RESTART" ]; then
+                RESTART_FLAG="--restart=$RESTART"
+            else
+                RESTART_FLAG=""
+            fi
 
-                    printf "${GREEN}=== Confirm before proceeding ===${NC}\n"
-                    printf "Pull latest image and recreate container? (y/n) "
-                    read -r REPLY
-                    case "$REPLY" in
-                        [Yy]|[Yy][Ee][Ss]) ;;
-                        *)
-                            echo "Cancelled."
-                            printf "Press Enter to continue..."
-                            read -r _dummy
-                            continue
-                            ;;
-                    esac
+            NETWORK=$(docker inspect --format='{{.HostConfig.NetworkMode}}' "$CONTAINER_NAME")
+            if [ "$NETWORK" != "default" ] && [ -n "$NETWORK" ]; then
+                NETWORK_FLAG="--network=$NETWORK"
+            else
+                NETWORK_FLAG=""
+            fi
 
-                    echo ""
-                    printf "${BLUE}=== Pulling latest image ===${NC}\n"
-                    docker pull "$IMAGE"
+            PRIVILEGED=$(docker inspect --format='{{.HostConfig.Privileged}}' "$CONTAINER_NAME")
+            if [ "$PRIVILEGED" = "true" ]; then
+                PRIVILEGED_FLAG="--privileged"
+            else
+                PRIVILEGED_FLAG=""
+            fi
 
-                    echo ""
-                    printf "${BLUE}=== Stopping container ===${NC}\n"
-                    docker stop "$CONTAINER_NAME"
+            RUN_CMD="docker run -d --name $CONTAINER_NAME $RESTART_FLAG $NETWORK_FLAG $PRIVILEGED_FLAG $PORTS $VOLUMES $ENV_VARS $IMAGE"
 
-                    printf "${BLUE}=== Removing old container ===${NC}\n"
-                    docker rm "$CONTAINER_NAME"
+            echo -e "${BLUE}=== Current configuration ===${NC}"
+            echo "$RUN_CMD"
+            echo ""
 
-                    echo ""
-                    printf "${BLUE}=== Creating new container ===${NC}\n"
-                    eval $RUN_CMD
+            echo -e "${BLUE}=== Volumes to preserve ===${NC}"
+            if [ -z "$VOLUMES" ]; then
+                echo -e "${RED}  (none - WARNING: container may not persist data!)${NC}"
+            else
+                docker inspect --format='{{range .Mounts}}  {{.Source}} -> {{.Destination}} ({{.Type}}){{println}}{{end}}' "$CONTAINER_NAME"
+            fi
+            echo ""
 
-                    echo ""
-                    printf "${GREEN}=== Upgrade complete! ===${NC}\n"
-                    docker ps --filter name="$CONTAINER_NAME"
+            echo -e "${GREEN}=== Confirm before proceeding ===${NC}"
+            portable_read_prompt "Pull latest image and recreate container? (y/n) " true
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                echo "Cancelled."
+                portable_read_prompt "Press Enter to continue..."
+                continue
+            fi
 
-                    set_field "$SELECTED_INDEX" "upgraded" "yes"
-                    set_field "$SELECTED_INDEX" "update" "unknown"
+            echo ""
+            echo -e "${BLUE}=== Pulling latest image ===${NC}"
+            docker pull "$IMAGE"
 
-                    scan_containers
-                    echo ""
-                    continue
-                    ;;
-            esac
-            ;;
+            echo ""
+            echo -e "${BLUE}=== Stopping container ===${NC}"
+            docker stop "$CONTAINER_NAME"
 
-        *)
-            printf "${RED}Invalid option${NC}\n"
-            ;;
-    esac
+            echo -e "${BLUE}=== Removing old container ===${NC}"
+            docker rm "$CONTAINER_NAME"
+
+            echo ""
+            echo -e "${BLUE}=== Creating new container ===${NC}"
+            eval $RUN_CMD
+
+            echo ""
+            echo -e "${GREEN}=== Upgrade complete! ===${NC}"
+            docker ps --filter name="$CONTAINER_NAME"
+
+            RECENTLY_UPGRADED_ARRAY[$SELECTED_INDEX]="yes"
+            UPDATE_AVAILABLE_ARRAY[$SELECTED_INDEX]="unknown"
+
+            scan_containers
+
+            echo ""
+            continue
+        fi
+    fi
+
+    echo -e "${RED}Invalid option${NC}"
 done
